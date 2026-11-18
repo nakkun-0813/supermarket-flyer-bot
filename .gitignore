@@ -36,3 +36,10 @@ debug_images/
 .idea/
 .DS_Store
 Thumbs.db
+
+# ローカル専用の設定・テストファイル（Git追跡対象外）
+.env
+.env.*
+*.local.json
+stores_local.json
+test_*.py

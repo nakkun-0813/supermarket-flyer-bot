@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import hashlib
 from io import BytesIO
 from PIL import Image, ImageDraw
@@ -8,12 +9,26 @@ from playwright.sync_api import sync_playwright
 from google import genai
 from google.genai import types
 
-CONFIG_PATH = "stores.json"
+CONFIG_PATH = os.environ.get("STORES_CONFIG_PATH", "stores.json")
 PREVIEW_DIR = "setup_previews"
 os.makedirs(PREVIEW_DIR, exist_ok=True)
 
 
 class FlyerLayoutAnalysis(BaseModel):
+    needs_initial_click: bool = Field(
+        description=(
+            "現在の画面が『小さなチラシサムネイルの一覧ページ（下に更新日などが並んでいる状態）』であり、"
+            "まず最新のチラシ（通常は一番左または上の最新日付のチラシ）をクリックして拡大ビューアを開く必要がある場合は True。"
+            "すでに大きなチラシ紙面（ビューア）が開いている場合は False。"
+        )
+    )
+    initial_click_point: list[int] | None = Field(
+        default=None,
+        description=(
+            "needs_initial_click が True の場合、クリックして開くべき最新チラシの中心座標 [y, x]（0〜1000の正規化座標）。"
+            "False の場合は null。"
+        )
+    )
     flyer_box: list[int] = Field(
         description=(
             "チラシ本体が描画されている領域のバウンディングボックス [ymin, xmin, ymax, xmax] "
@@ -35,25 +50,24 @@ class FlyerLayoutAnalysis(BaseModel):
         )
     )
     reasoning: str = Field(
-        description="なぜこの領域とボタン位置と判断したかの簡潔な説明"
+        description="なぜこの領域・操作と判断したかの簡潔な説明"
     )
 
 
-def get_vision_model(client: genai.Client) -> str:
+def get_vision_models(client: genai.Client) -> list[str]:
     preferred = [
         "gemini-3.8-flash",
         "gemini-3.5-flash-lite",
         "gemini-3.1-flash-lite",
+        "gemini-3.7-flash",
         "gemini-2.5-pro",
     ]
     try:
         available = [m.name.replace("models/", "") for m in client.models.list()]
-        for p in preferred:
-            if p in available:
-                return p
+        selected = [p for p in preferred if p in available]
+        return selected if selected else preferred
     except Exception:
-        pass
-    return preferred[0]
+        return preferred
 
 
 def load_config() -> dict:
@@ -82,10 +96,8 @@ def draw_debug_overlay(full_img: Image.Image, clip: dict, next_pt: list[int] | N
     draw = ImageDraw.Draw(overlay)
     x1, y1 = clip["x"], clip["y"]
     x2, y2 = x1 + clip["width"], y1 + clip["height"]
-    # 赤枠でチラシ認識領域を描画
     for offset in range(6):
         draw.rectangle([x1 - offset, y1 - offset, x2 + offset, y2 + offset], outline=(255, 0, 0))
-    # 青丸で次ページボタン位置を描画
     if next_pt and len(next_pt) == 2:
         ny = int(next_pt[0] / 1000 * full_img.height)
         nx = int(next_pt[1] / 1000 * full_img.width)
@@ -96,19 +108,24 @@ def draw_debug_overlay(full_img: Image.Image, clip: dict, next_pt: list[int] | N
 
 def analyze_layout(
     client: genai.Client,
-    model_name: str,
+    models: list[str],
     full_jpeg_bytes: bytes,
     previous_result: dict | None = None,
     user_feedback: str | None = None,
+    already_opened_viewer: bool = False,
 ) -> FlyerLayoutAnalysis:
     base_prompt = (
-        "このWebページのスクリーンショットから、スーパーの『特売チラシ本体』の領域と、"
-        "『次ページ（裏面）へめくるボタン』の位置を特定してください。\n"
+        "このWebページのスクリーンショットから、スーパーの『特売チラシ』の取得方法を判定してください。\n"
         "【重要ルール】\n"
-        "- サイト上部のヘッダー、店舗名タイトル、検索窓、右サイドバーの他店チラシ広告は絶対に flyer_box に含めないでください。\n"
-        "- チラシの紙面（商品写真や価格が載っている長方形領域）だけを正確に囲んでください。\n"
-        "- next_page_point は『チラシをめくる』『次へ』『＞』など、現在の店舗のチラシを裏面へ切り替えるUIボタンの中心座標のみを指定してください。"
+        "1. もし画面上に『小さなチラシのサムネイルカードが横に複数並んでいる（下に〇〇月〇〇日更新などと書かれている）』状態であれば、"
+        "それは一覧画面です。needs_initial_click=True とし、一番新しいチラシ（通常は一番左のカード）の中心座標を initial_click_point に指定してください。\n"
+        "2. すでに大きなチラシ本体（ビューア）が表示されている場合は needs_initial_click=False とし、"
+        "サイト上部のヘッダー、店舗名タイトル、右サイドバーの他店広告を除外して、チラシ紙面だけを flyer_box で囲んでください。\n"
+        "3. next_page_point は『チラシをめくる』『次へ』『＞』など、現在のチラシを裏面へ切り替えるUIボタンの中心座標のみを指定してください。"
     )
+
+    if already_opened_viewer:
+        base_prompt += "\n※すでにサムネイルをクリックしてチラシ詳細ビューアを開いた後の画面です。needs_initial_click は必ず False にして、大きく表示されているチラシ本体を flyer_box で囲んでください。"
 
     if previous_result and user_feedback:
         base_prompt += (
@@ -119,16 +136,41 @@ def analyze_layout(
         )
 
     part = types.Part.from_bytes(data=full_jpeg_bytes, mime_type="image/jpeg")
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[part, base_prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=FlyerLayoutAnalysis,
-            temperature=0.0,
-        ),
-    )
-    return FlyerLayoutAnalysis.model_validate_json(response.text)
+
+    last_error = None
+    for model_name in models:
+        for attempt in range(2):
+            try:
+                print(f"  -> {model_name} で推論中...", flush=True)
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=[part, base_prompt],
+                    config=types.GenerateContentConfig(
+                        response_mime_type="application/json",
+                        response_schema=FlyerLayoutAnalysis,
+                        temperature=0.0,
+                    ),
+                )
+                return FlyerLayoutAnalysis.model_validate_json(response.text)
+            except Exception as e:
+                last_error = e
+                err_msg = str(e)
+                if any(code in err_msg for code in ["503", "504", "429", "UNAVAILABLE", "DEADLINE_EXCEEDED"]):
+                    print(f"  [一時混雑/タイムアウト] {model_name} が遅延しています。3秒後に再試行/別モデルへ切り替えます...", flush=True)
+                    time.sleep(3)
+                else:
+                    raise
+
+    raise RuntimeError(f"すべてのモデルで推論に失敗しました: {last_error}")
+
+
+def get_ai_jpeg(page) -> tuple[Image.Image, bytes]:
+    full_png = page.screenshot(scale="css")
+    full_img = Image.open(BytesIO(full_png))
+    ai_img = full_img.convert("RGB").resize((1000, int(1000 * full_img.height / full_img.width)), Image.Resampling.LANCZOS)
+    buf = BytesIO()
+    ai_img.save(buf, format="JPEG", quality=80)
+    return full_img, buf.getvalue()
 
 
 def main():
@@ -136,9 +178,9 @@ def main():
         print("エラー: 環境変数 GEMINI_API_KEY が設定されていません。")
         return
 
-    client = genai.Client(http_options=types.HttpOptions(timeout=90000))
-    model_name = get_vision_model(client)
-    print(f"使用モデル: {model_name}")
+    client = genai.Client(http_options=types.HttpOptions(timeout=120000))
+    models = get_vision_models(client)
+    print(f"保存先設定ファイル: {CONFIG_PATH}")
 
     store_name = input("1. 登録する店舗名を入力してください（例: ダイエー池田駅前店）: ").strip()
     store_url = input("2. ターゲットとするスーパーのチラシURLを入力してください: ").strip()
@@ -165,20 +207,33 @@ def main():
         page.evaluate("window.scrollTo(0, 0)")
         page.wait_for_timeout(1000)
 
-        # AI解析用に等倍相当の全体スクリーンショットを取得
-        full_png = page.screenshot(scale="css")
-        full_img = Image.open(BytesIO(full_png))
-        buf = BytesIO()
-        full_img.convert("RGB").save(buf, format="JPEG", quality=85)
-        full_jpeg = buf.getvalue()
+        full_img, full_jpeg = get_ai_jpeg(page)
 
         prev_dict = None
         feedback = None
         attempt = 1
+        initial_click_xy = None
 
         while True:
             print(f"\n[AI解析 第{attempt}回] チラシ位置を推論しています...")
-            analysis = analyze_layout(client, model_name, full_jpeg, prev_dict, feedback)
+            analysis = analyze_layout(
+                client, models, full_jpeg, prev_dict, feedback,
+                already_opened_viewer=(initial_click_xy is not None)
+            )
+
+            # 一覧ページと判定された場合は、まずサムネイルをクリックして詳細ビューアを開く
+            if analysis.needs_initial_click and analysis.initial_click_point and len(analysis.initial_click_point) == 2 and initial_click_xy is None:
+                iy = int(analysis.initial_click_point[0] / 1000 * viewport_h)
+                ix = int(analysis.initial_click_point[1] / 1000 * viewport_w)
+                initial_click_xy = {"x": ix, "y": iy}
+                print(f"  [一覧ページ検出] 最新のチラシサムネイル ({ix}, {iy}) をクリックして拡大画面を開きます...")
+                page.mouse.click(ix, iy)
+                page.wait_for_timeout(4500)
+                page.evaluate("window.scrollTo(0, 0)")
+                page.wait_for_timeout(1000)
+                full_img, full_jpeg = get_ai_jpeg(page)
+                analysis = analyze_layout(client, models, full_jpeg, None, None, already_opened_viewer=True)
+
             clip = norm_to_pixel_box(analysis.flyer_box, viewport_w, viewport_h)
 
             overlay_path = os.path.join(PREVIEW_DIR, f"preview_overlay_{attempt}.jpg")
@@ -187,12 +242,10 @@ def main():
 
             draw_debug_overlay(full_img, clip, analysis.next_page_point, overlay_path)
 
-            # 表面の切り抜きプレビュー保存
             front_bytes = page.screenshot(clip=clip)
             with open(crop_front_path, "wb") as f:
                 f.write(front_bytes)
 
-            # 裏面ボタンがあればテストクリックして裏面プレビューも保存
             has_back_captured = False
             next_click_xy = None
             if analysis.has_next_page and analysis.next_page_point and len(analysis.next_page_point) == 2:
@@ -208,12 +261,16 @@ def main():
                     has_back_captured = True
                     with open(crop_back_path, "wb") as f:
                         f.write(back_bytes)
-                # 次回再試行に備えてリロードして初期状態に戻す
+                # 初期状態へ戻す
                 page.goto(store_url, wait_until="networkidle", timeout=45000)
                 page.wait_for_timeout(3000)
+                if initial_click_xy:
+                    page.mouse.click(initial_click_xy["x"], initial_click_xy["y"])
+                    page.wait_for_timeout(4000)
 
             print("\n--- AIの認識結果 ---")
             print(f"判断理由: {analysis.reasoning}")
+            print(f"事前クリック（一覧→詳細）: {initial_click_xy if initial_click_xy else 'なし'}")
             print(f"切り抜き座標: {clip}")
             print(f"見開き左右分割: {'あり' if analysis.is_double_spread else 'なし'}")
             print(f"裏面キャプチャテスト: {'成功 (' + crop_back_path + ')' if has_back_captured else 'なし / 未検出'}")
@@ -232,6 +289,7 @@ def main():
                     "name": store_name,
                     "url": store_url,
                     "viewport": {"width": viewport_w, "height": viewport_h},
+                    "initial_click": initial_click_xy,
                     "clip_area": clip,
                     "is_double_spread": analysis.is_double_spread,
                     "next_page_click": next_click_xy if has_back_captured else None,
